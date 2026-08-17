@@ -1,0 +1,45 @@
+<!doctype html>
+<!-- optionai spinner — drives the vendored thinking-orbs engine (no React).
+     Query params: ?state=composing&size=64 -->
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; background: transparent; overflow: hidden; }
+  canvas { display: block; }
+</style>
+<canvas id="orb"></canvas>
+<script type="module">
+  import { resolvePreset, MODE_DRAWS } from "./engine.es.js";
+
+  const params = new URLSearchParams(location.search);
+  const state = params.get("state") || "composing";
+  const size = Number(params.get("size") || 64);
+
+  const canvas = document.getElementById("orb");
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  canvas.width = Math.round(size * dpr);
+  canvas.height = Math.round(size * dpr);
+  canvas.style.width = size + "px";
+  canvas.style.height = size + "px";
+  const ctx = canvas.getContext("2d");
+
+  const darkQuery = matchMedia("(prefers-color-scheme: dark)");
+  let dark = darkQuery.matches;
+  darkQuery.addEventListener("change", (e) => { dark = e.matches; });
+
+  const { mode, speed, opts } = resolvePreset(state, size);
+  const draw = MODE_DRAWS[mode];
+
+  const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  if (reduced) {
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    draw(ctx, size, 0.6, dark, opts);
+  } else {
+    function frame() {
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, size, size);
+      draw(ctx, size, (performance.now() / 1000) * speed, dark, opts);
+      requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+  }
+</script>
