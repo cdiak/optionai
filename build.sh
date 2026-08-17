@@ -7,7 +7,6 @@ swiftc -O \
   -o "$OUT" \
   OptionAI.swift \
   -framework AppKit \
-  -framework Carbon \
   -framework ApplicationServices \
   -framework WebKit
 # Sign with a stable identity so the Accessibility (TCC) grant survives

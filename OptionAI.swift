@@ -16,7 +16,6 @@
 
 import AppKit
 import ApplicationServices
-import Carbon
 import Foundation
 import WebKit
 
@@ -114,7 +113,7 @@ enum ContextCapturer {
 
         if !AXIsProcessTrusted() {
             fputs(
-                "optionai: Accessibility not granted (or granted after launch — restart optionai)\n",
+                "optionai: Accessibility not granted\n",
                 stderr
             )
         }
@@ -600,9 +599,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var engine: AgentEngine!
     private var orb: OrbPanel!
     private var statusItem: NSStatusItem?
-    private var hotKeyRef: EventHotKeyRef?
-    private var eventHandler: EventHandlerRef?
     private var eventTap: CFMachPort?
+    private var tapRetryTimer: Timer?
     private var chordHeld: Set<Int64> = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -618,29 +616,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 """
                 optionai: grant Accessibility access so context can be read and text pasted.
                   System Settings → Privacy & Security → Accessibility → enable optionai
-                (You may need to restart this app after granting.)
 
                 """,
                 stderr
             )
         }
 
-        let hotkeyLabel: String
-        if registerChordTap() {
-            hotkeyLabel = "Option+A+I (two-hand chord; ⌥A/⌥I are reserved while optionai runs)"
-        } else {
-            fputs(
-                "optionai: event tap unavailable (Accessibility not granted?) — falling back to Option+Shift+A\n",
-                stderr
-            )
-            registerHotkey()
-            hotkeyLabel = "Option+Shift+A (fallback)"
-        }
-
         fputs(
             """
             optionai ready
-              hotkey: \(hotkeyLabel)
               claude: \(config.claudeBinary)
               model:  \(config.model ?? "(cli default)")
               orb:    \(config.orbDir?.path ?? "(none — menu-bar indicator only)")
@@ -650,7 +634,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
 
         setupStatusItem()
+
+        // The chord needs a CGEvent tap, which macOS grants only after the
+        // Accessibility approval. If the tap fails now (fresh install, dialog
+        // still open), keep retrying — the hotkey activates the moment the
+        // user flips the toggle. There is no fallback hotkey: the app is
+        // named after its chord.
+        if registerChordTap() {
+            hotkeyActive()
+        } else {
+            updateStatus("waiting")
+            fputs(
+                "optionai: waiting for Accessibility — Option+A+I activates automatically once granted\n",
+                stderr
+            )
+            let timer = Timer(timeInterval: 2.0, repeats: true) { [weak self] _ in
+                guard let self else { return }
+                if self.registerChordTap() {
+                    self.tapRetryTimer?.invalidate()
+                    self.tapRetryTimer = nil
+                    self.hotkeyActive()
+                }
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            tapRetryTimer = timer
+        }
+    }
+
+    private func hotkeyActive() {
         updateStatus("idle")
+        fputs(
+            "optionai: hotkey Option+A+I active (two-hand chord; ⌥A/⌥I are reserved while optionai runs)\n",
+            stderr
+        )
     }
 
     // MARK: trigger
@@ -786,8 +802,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         switch state {
         case "thinking":
             statusItem?.button?.title = "◍"
+            statusItem?.button?.toolTip = "optionai — thinking (⌥A+I to cancel)"
+        case "waiting":
+            statusItem?.button?.title = "◌"
+            statusItem?.button?.toolTip =
+                "optionai — grant Accessibility to enable Option+A+I "
+                + "(System Settings → Privacy & Security → Accessibility)"
         default:
             statusItem?.button?.title = "AI"
+            statusItem?.button?.toolTip = "optionai — Option+A+I"
         }
     }
 
@@ -807,8 +830,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: hotkey — Option+A+I chord (CGEvent tap)
 
-    /// Carbon hotkeys cannot express a two-letter chord, so a session event
-    /// tap tracks held keys. ⌥A ("å") and ⌥I (dead-key ˆ) are swallowed so
+    /// A two-letter chord is not expressible as a normal global hotkey, so a
+    /// session event tap tracks held keys. ⌥A ("å") and ⌥I (dead-key ˆ) are swallowed so
     /// the chord never types accented characters into the focused app.
     private func registerChordTap() -> Bool {
         let mask: CGEventMask =
@@ -892,57 +915,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    // MARK: hotkey — Option+Shift+A (Carbon fallback)
-
-    private func registerHotkey() {
-        // Option+Shift+A
-        let hotKeyID = EventHotKeyID(signature: OSType(0x4F504149), id: 1) // 'OPAI'
-        let keyCode = UInt32(kVK_ANSI_A)
-        let modifiers = UInt32(optionKey | shiftKey)
-
-        var handlerSpec = EventTypeSpec(
-            eventClass: OSType(kEventClassKeyboard),
-            eventKind: UInt32(kEventHotKeyPressed)
-        )
-
-        let userData = Unmanaged.passUnretained(self).toOpaque()
-        InstallEventHandler(
-            GetApplicationEventTarget(),
-            { (_, event, userData) -> OSStatus in
-                guard let userData else { return noErr }
-                let app = Unmanaged<AppDelegate>.fromOpaque(userData).takeUnretainedValue()
-                var hk = EventHotKeyID()
-                GetEventParameter(
-                    event,
-                    EventParamName(kEventParamDirectObject),
-                    EventParamType(typeEventHotKeyID),
-                    nil,
-                    MemoryLayout<EventHotKeyID>.size,
-                    nil,
-                    &hk
-                )
-                if hk.id == 1 {
-                    DispatchQueue.main.async {
-                        app.trigger()
-                    }
-                }
-                return noErr
-            },
-            1,
-            &handlerSpec,
-            userData,
-            &eventHandler
-        )
-
-        RegisterEventHotKey(
-            keyCode,
-            modifiers,
-            hotKeyID,
-            GetApplicationEventTarget(),
-            0,
-            &hotKeyRef
-        )
-    }
 }
 
 // MARK: - main

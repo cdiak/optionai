@@ -42,6 +42,7 @@ Steps:
 5. Permissions (cannot be automated — be explicit)
    - Tell me I must enable Accessibility for optionai in:
        System Settings → Privacy & Security → Accessibility
+   - Tell me the hotkey activates automatically the moment I flip the toggle: the menu bar item turns from ◌ to AI. No restart needed.
    - If the app is missing from that list, run ~/.local/bin/optionai once from the terminal to trigger registration, then:
        launchctl kickstart -k "gui/$(id -u)/com.cdiak.optionai"
 6. Report when done
@@ -74,6 +75,8 @@ cd optionai
 This builds `~/.local/bin/optionai` and registers a login LaunchAgent.
 
 Then grant one permission: **System Settings → Privacy & Security → Accessibility → optionai**. This one permission covers both reading the textbox and pasting.
+
+The Option+A+I chord activates the moment you flip the toggle — no restart needed. Until then, the menu bar shows **`◌`** (waiting for permission); it turns to **`AI`** when the hotkey is live.
 
 ## The context rule
 
@@ -137,7 +140,7 @@ OPTIONAI_MODEL=claude-sonnet-5 OPTIONAI_TIMEOUT=120 ./install.sh
 | Pop | Canceled |
 | Basso | Agent failed (see `~/Library/Logs/optionai.log`) |
 
-Menu bar: **`AI`** idle · **`◍`** thinking (plus the floating orb). Quit from the menu bar item.
+Menu bar: **`AI`** idle · **`◍`** thinking · **`◌`** waiting for Accessibility (plus the floating orb). Quit from the menu bar item.
 
 ## Uninstall
 

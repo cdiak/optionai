@@ -112,6 +112,7 @@ echo
 echo "Permissions (first run):"
 echo "  System Settings → Privacy & Security → Accessibility → optionai"
 echo "  If missing from the list, run once: $DEST"
+echo "  Option+A+I activates automatically once granted (menu bar: ◌ → AI, no restart)"
 echo
 echo "Menu bar: \"AI\" idle · \"◍\" thinking (plus a floating orb near the caret)"
 echo "Uninstall: ./uninstall.sh"
