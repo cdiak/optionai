@@ -109,7 +109,7 @@ So you can:
 
 ## The orb
 
-The spinner is the **composing** state from [thinking-orbs](https://github.com/Jakubantalik/thinking-orbs) (MIT, Jakub Antalik). We vendor only the framework-free canvas engine (`orb/engine.es.js`, pinned from `thinking-orbs@0.3.1`, zero dependencies, no network calls) and drive it with a 20-line vanilla script in `orb/orb.html`, rendered in a borderless WKWebView panel near the pointer. License in `orb/LICENSE.thinking-orbs`.
+The spinner is the **composing** state from [thinking-orbs](https://github.com/Jakubantalik/thinking-orbs) (MIT, Jakub Antalik). We vendor only the framework-free canvas engine (pinned from `thinking-orbs@0.3.1`, zero dependencies, no network calls) and drive it with a short vanilla script, rendered in a borderless WKWebView panel near the pointer. The engine is inlined into `orb/orb.html`: WebKit refuses ES-module fetches from `file://` pages, so a separate module file would silently never load. `orb/engine.es.js` stays as the pristine vendored copy. License in `orb/LICENSE.thinking-orbs`.
 
 ## Configuration
 
