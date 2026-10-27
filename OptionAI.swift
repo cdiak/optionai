@@ -2,6 +2,7 @@
 //
 // Option+A+I (two-hand chord) → capture the focused textbox's context → send it to a
 // coding agent (claude -p) → paste the response at the cursor.
+// Option+L+M uses the same workflow with a local Qwen model through Ollama.
 //
 // Context rule (simple, by design):
 //   1. Highlighted text → the highlight is the context. Works everywhere:
@@ -47,7 +48,6 @@ struct Config {
             env["OPTIONAI_ORB_DIR"].map { URL(fileURLWithPath: $0) }
             ?? firstExisting([
                 "\(home)/.local/share/optionai/orb",
-                "\(home)/Development/Projects/optionai/orb",
             ]).map { URL(fileURLWithPath: $0) }
 
         // Empty env values (e.g. an unset plist key) mean "not set".
@@ -106,7 +106,15 @@ struct Capture {
 
 enum ContextCapturer {
 
-    static func capture(maxChars: Int) -> Capture? {
+    enum CaptureError: LocalizedError {
+        case tooLong
+
+        var errorDescription: String? {
+            "The text is too long for local capture. Select a shorter excerpt; nothing was sent."
+        }
+    }
+
+    static func capture(maxChars: Int, requireComplete: Bool = false) throws -> Capture? {
         let front = NSWorkspace.shared.frontmostApplication
         let pid = front?.processIdentifier ?? 0
         let appName = front?.localizedName ?? "unknown"
@@ -150,6 +158,7 @@ enum ContextCapturer {
 
         // Rule 1: a native selection is the context.
         if let selected, !selected.isEmpty {
+            if requireComplete, selected.count > maxChars { throw CaptureError.tooLong }
             return Capture(
                 context: .selection(clamp(selected, maxChars)),
                 appPID: pid, appName: appName, caretScreenPoint: caret
@@ -158,8 +167,11 @@ enum ContextCapturer {
 
         // Rule 2: a readable textbox — the whole document, split at the cursor.
         if let value, !value.isEmpty {
-            let cursor = cursorIndex(element) ?? value.count
-            let (before, after) = split(value, at: cursor, maxChars: maxChars)
+            if requireComplete, value.count > maxChars { throw CaptureError.tooLong }
+            let cursor = cursorIndex(element) ?? value.utf16.count
+            let (before, after) = split(
+                value, at: cursor, maxChars: maxChars, requireComplete: requireComplete
+            )
             return Capture(
                 context: .document(before: before, after: after),
                 appPID: pid, appName: appName, caretScreenPoint: caret
@@ -172,6 +184,7 @@ enum ContextCapturer {
         // read → restore the user's clipboard). The clipboard is transport,
         // never an input channel — stale contents are never used.
         if let highlighted = captureSelectionViaCopy() {
+            if requireComplete, highlighted.count > maxChars { throw CaptureError.tooLong }
             return Capture(
                 context: .webSelection(clamp(highlighted, maxChars)),
                 appPID: pid, appName: appName, caretScreenPoint: caret
@@ -300,15 +313,19 @@ enum ContextCapturer {
         s.count <= maxChars ? s : String(s.suffix(maxChars))
     }
 
-    /// Split at a UTF-16-ish index, keeping ~75% of the budget before the
-    /// cursor and ~25% after.
-    private static func split(_ s: String, at index: Int, maxChars: Int)
+    /// AX offsets are UTF-16. Local requests keep all captured text; the
+    /// Claude path retains its existing ~75% before / ~25% after budget.
+    private static func split(
+        _ s: String, at index: Int, maxChars: Int, requireComplete: Bool
+    )
         -> (String, String)
     {
-        let chars = Array(s)
-        let i = max(0, min(index, chars.count))
-        var before = String(chars[0..<i])
-        var after = String(chars[i...])
+        let offset = max(0, min(index, s.utf16.count))
+        let utf16Index = s.utf16.index(s.utf16.startIndex, offsetBy: offset)
+        let splitIndex = String.Index(utf16Index, within: s) ?? s.endIndex
+        var before = String(s[..<splitIndex])
+        var after = String(s[splitIndex...])
+        if requireComplete { return (before, after) }
         let beforeBudget = maxChars * 3 / 4
         let afterBudget = maxChars - beforeBudget
         if before.count > beforeBudget { before = String(before.suffix(beforeBudget)) }
@@ -350,15 +367,7 @@ final class AgentEngine {
         generation += 1
         let gen = generation
 
-        let payload: String
-        switch capture.context {
-        case .selection(let text):
-            payload = "<selection>\n\(text)\n</selection>"
-        case .document(let before, let after):
-            payload = "<document>\n\(before)<cursor/>\(after)\n</document>"
-        case .webSelection(let text):
-            payload = "<selection>\n\(text)\n</selection>"
-        }
+        let payload = Self.payload(for: capture.context)
 
         let p = Process()
         p.executableURL = URL(fileURLWithPath: config.claudeBinary)
@@ -446,6 +455,15 @@ final class AgentEngine {
         isBusy = false
     }
 
+    static func payload(for context: CapturedContext) -> String {
+        switch context {
+        case .selection(let text), .webSelection(let text):
+            return "<selection>\n\(text)\n</selection>"
+        case .document(let before, let after):
+            return "<document>\n\(before)<cursor/>\(after)\n</document>"
+        }
+    }
+
     /// Trim, and strip one wrapping code fence if the model added one anyway.
     static func postProcess(_ raw: String) -> String {
         var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -459,6 +477,214 @@ final class AgentEngine {
             }
         }
         return s
+    }
+}
+
+// MARK: - Local model (loopback Ollama only)
+
+enum AgentBackend {
+    case claude
+    case local
+
+    var label: String { self == .local ? "local Qwen" : "Claude" }
+}
+
+/// No configurable URL, model, redirects, proxy, or cloud fallback. Only the
+/// final assistant content is eligible for insertion; thinking is never used.
+final class LocalAgentEngine: NSObject, URLSessionTaskDelegate {
+    static let model = "qwen3.5:9b-q4_K_M"
+    static let timeoutSeconds: TimeInterval = 600
+    // Ollama 0.34.2 supports disabling both prompt truncation and context
+    // shifting. Check the version before sending text so older servers cannot
+    // silently ignore these flags. The backend rejects context overflow.
+    private static let minimumVersion = [0, 34, 2]
+
+    private var task: URLSessionDataTask?
+    private var session: URLSession?
+    private var timeoutWork: DispatchWorkItem?
+    private var generation = 0
+    private(set) var isBusy = false
+
+    private struct Response: Decodable {
+        struct Message: Decodable {
+            let role: String
+            let content: String
+        }
+        let model: String
+        let done: Bool
+        let done_reason: String?
+        let message: Message
+    }
+
+    private static func failure(_ description: String) -> NSError {
+        NSError(
+            domain: "optionai.local", code: 1,
+            userInfo: [NSLocalizedDescriptionKey: description]
+        )
+    }
+
+    /// Call and cancel on the main thread; callbacks also arrive there.
+    func run(context: CapturedContext, onDone: @escaping (Result<String, Error>) -> Void) {
+        precondition(Thread.isMainThread)
+        guard !isBusy else { return }
+        let payload = AgentEngine.payload(for: context)
+
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:11434/api/chat")!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = Self.timeoutSeconds
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.httpShouldHandleCookies = false
+        do {
+            request.httpBody = try JSONSerialization.data(withJSONObject: [
+                "model": Self.model,
+                "messages": [
+                    ["role": "system", "content": AgentEngine.instruction],
+                    ["role": "user", "content": payload],
+                ],
+                "think": false,
+                "stream": false,
+                "truncate": false,
+                "shift": false,
+                "keep_alive": "5m",
+                "options": [
+                    "num_ctx": 32768,
+                    "num_predict": 2048,
+                    "temperature": 0.2,
+                    "top_p": 0.9,
+                ],
+            ])
+        } catch {
+            onDone(.failure(Self.failure("Unable to prepare the local model request.")))
+            return
+        }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.connectionProxyDictionary = [:]
+        configuration.httpShouldSetCookies = false
+        configuration.httpCookieStorage = nil
+        configuration.urlCredentialStorage = nil
+        configuration.urlCache = nil
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        configuration.timeoutIntervalForRequest = Self.timeoutSeconds
+        configuration.timeoutIntervalForResource = Self.timeoutSeconds
+        let session = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
+        self.session = session
+        isBusy = true
+        generation += 1
+        let gen = generation
+
+        let chatTask = session.dataTask(with: request) { [weak self] data, response, error in
+            DispatchQueue.main.async {
+                guard let self, self.generation == gen, self.isBusy else { return }
+                self.finish()
+                // Never include server bodies or localized network errors in
+                // logs: either can contain captured private text.
+                if let error = error as NSError? {
+                    let description = error.code == NSURLErrorTimedOut
+                        ? "Local model timed out after 600 seconds. Try a shorter excerpt."
+                        : "Cannot reach the local model. Check that local Ollama is running and the Qwen model is installed."
+                    onDone(.failure(Self.failure(description)))
+                    return
+                }
+                guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+                    let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+                    let hint = status == 400
+                        ? " The text may exceed the 32K context; select a shorter excerpt."
+                        : " Check local Ollama and the installed Qwen model."
+                    onDone(.failure(Self.failure("Local model request failed (HTTP \(status))." + hint)))
+                    return
+                }
+                guard let data, let reply = try? JSONDecoder().decode(Response.self, from: data),
+                    reply.model == Self.model, reply.done, reply.message.role == "assistant"
+                else {
+                    onDone(.failure(Self.failure("Local model returned an invalid or incomplete response.")))
+                    return
+                }
+                guard reply.done_reason == "stop" else {
+                    onDone(.failure(Self.failure(
+                        "Local model stopped before finishing. Ask for a shorter response; nothing was inserted."
+                    )))
+                    return
+                }
+                let text = AgentEngine.postProcess(reply.message.content)
+                guard !text.isEmpty, !text.contains("<think>"), !text.contains("</think>") else {
+                    onDone(.failure(Self.failure("Local model returned no usable final answer.")))
+                    return
+                }
+                onDone(.success(text))
+            }
+        }
+        var versionRequest = URLRequest(url: URL(string: "http://127.0.0.1:11434/api/version")!)
+        versionRequest.timeoutInterval = 10
+        versionRequest.cachePolicy = .reloadIgnoringLocalCacheData
+        versionRequest.httpShouldHandleCookies = false
+        let versionTask = session.dataTask(with: versionRequest) { [weak self] data, response, error in
+            DispatchQueue.main.async {
+                guard let self, self.generation == gen, self.isBusy else { return }
+                guard error == nil, (response as? HTTPURLResponse)?.statusCode == 200,
+                    let data,
+                    let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                    let version = object["version"] as? String,
+                    Self.supportsCompleteContext(version)
+                else {
+                    chatTask.cancel()
+                    self.finish()
+                    onDone(.failure(Self.failure(
+                        "Local Ollama 0.34.2 or later must be running with Qwen installed. "
+                        + "The local connection/version check failed; no text was sent."
+                    )))
+                    return
+                }
+                self.task = chatTask
+                chatTask.resume()
+            }
+        }
+        self.task = versionTask
+        let timeout = DispatchWorkItem { [weak self] in
+            guard let self, self.generation == gen, self.isBusy else { return }
+            self.cancel()
+            onDone(.failure(Self.failure("Local model timed out after 600 seconds. Try a shorter excerpt.")))
+        }
+        timeoutWork = timeout
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.timeoutSeconds, execute: timeout)
+        versionTask.resume()
+    }
+
+    private static func supportsCompleteContext(_ version: String) -> Bool {
+        let parts = version.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 3,
+            parts.allSatisfy({ !$0.isEmpty && $0.allSatisfy(\.isNumber) })
+        else { return false }
+        let numbers = parts.compactMap { Int($0) }
+        guard numbers.count == 3 else { return false }
+        return !numbers.lexicographicallyPrecedes(minimumVersion)
+    }
+
+    func cancel() {
+        precondition(Thread.isMainThread)
+        generation += 1
+        task?.cancel()
+        session?.invalidateAndCancel()
+        finish()
+    }
+
+    private func finish() {
+        timeoutWork?.cancel()
+        timeoutWork = nil
+        task = nil
+        session?.finishTasksAndInvalidate()
+        session = nil
+        isBusy = false
+    }
+
+    func urlSession(
+        _ session: URLSession, task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        completionHandler(nil)
     }
 }
 
@@ -597,11 +823,19 @@ final class OrbPanel {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var config: Config!
     private var engine: AgentEngine!
+    private let localEngine = LocalAgentEngine()
+    private var activeBackend: AgentBackend?
     private var orb: OrbPanel!
     private var statusItem: NSStatusItem?
     private var eventTap: CFMachPort?
     private var tapRetryTimer: Timer?
     private var chordHeld: Set<Int64> = []
+    private var swallowedKeys: Set<Int64> = []
+    private var chordTriggered = false
+    private let chords: [(backend: AgentBackend, keys: Set<Int64>)] = [
+        (.claude, [0, 34]),  // kVK_ANSI_A, kVK_ANSI_I
+        (.local, [37, 46]),  // kVK_ANSI_L, kVK_ANSI_M
+    ]
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         config = Config.load()
@@ -627,6 +861,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             optionai ready
               claude: \(config.claudeBinary)
               model:  \(config.model ?? "(cli default)")
+              local:  \(LocalAgentEngine.model) at 127.0.0.1:11434 (no cloud fallback)
               orb:    \(config.orbDir?.path ?? "(none — menu-bar indicator only)")
 
             """,
@@ -645,7 +880,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             updateStatus("waiting")
             fputs(
-                "optionai: waiting for Accessibility — Option+A+I activates automatically once granted\n",
+                "optionai: waiting for Accessibility — Option+A+I and Option+L+M activate automatically once granted\n",
                 stderr
             )
             let timer = Timer(timeInterval: 2.0, repeats: true) { [weak self] _ in
@@ -664,17 +899,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func hotkeyActive() {
         updateStatus("idle")
         fputs(
-            "optionai: hotkey Option+A+I active (two-hand chord; ⌥A/⌥I are reserved while optionai runs)\n",
+            "optionai: hotkeys Option+A+I (Claude), Option+L+M (local Qwen) active; ⌥A/⌥I/⌥L/⌥M are reserved\n",
             stderr
         )
     }
 
     // MARK: trigger
 
-    func trigger() {
-        if engine.isBusy {
-            // Second press cancels the in-flight request.
+    func trigger(backend: AgentBackend = .claude) {
+        if engine.isBusy || localEngine.isBusy {
+            // Either chord cancels the active request. It never changes the
+            // backend or starts a second request as a side effect.
             engine.cancel()
+            localEngine.cancel()
+            activeBackend = nil
             orb.hide()
             updateStatus("idle")
             NSSound(named: .init("Pop"))?.play()
@@ -682,8 +920,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        guard let capture = ContextCapturer.capture(maxChars: config.maxContextChars)
-        else {
+        let captured: Capture?
+        do {
+            captured = try ContextCapturer.capture(
+                maxChars: config.maxContextChars, requireComplete: backend == .local
+            )
+        } catch {
+            showFailure(error, backend: backend)
+            return
+        }
+        guard let capture = captured else {
             NSSound.beep()
             fputs(
                 """
@@ -704,21 +950,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             kind = "document (\(b.count)+\(a.count) chars)"
         case .webSelection: kind = "highlight (via synthetic copy)"
         }
-        fputs("optionai: captured \(kind) from \(capture.appName)\n", stderr)
+        fputs("optionai: \(backend.label) captured \(kind) from \(capture.appName)\n", stderr)
 
         NSSound(named: .init("Tink"))?.play()
+        activeBackend = backend
         updateStatus("thinking")
         orb.show(near: capture.caretScreenPoint)
 
-        engine.run(capture: capture) { [weak self] result in
+        let completion: (Result<String, Error>) -> Void = { [weak self] result in
             guard let self else { return }
             self.orb.hide()
+            self.activeBackend = nil
             self.updateStatus("idle")
 
             switch result {
             case .failure(let error):
-                NSSound(named: .init("Basso"))?.play()
-                fputs("optionai: agent failed: \(error.localizedDescription)\n", stderr)
+                self.showFailure(error, backend: backend)
 
             case .success(let text):
                 guard !text.isEmpty else {
@@ -767,6 +1014,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         }
+        switch backend {
+        case .claude:
+            engine.run(capture: capture, onDone: completion)
+        case .local:
+            localEngine.run(context: capture.context, onDone: completion)
+        }
+    }
+
+    private func showFailure(_ error: Error, backend: AgentBackend) {
+        NSSound(named: .init("Basso"))?.play()
+        fputs("optionai: \(backend.label) failed: \(error.localizedDescription)\n", stderr)
+        if backend == .local {
+            statusItem?.button?.title = "LM!"
+            statusItem?.button?.toolTip = "Local model: \(error.localizedDescription)"
+        }
     }
 
     // MARK: status item
@@ -775,13 +1037,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = item.button {
             button.title = "AI"
-            button.toolTip = "optionai — Option+A+I"
+            button.toolTip = "optionai — ⌥A+I: Claude · ⌥L+M: local Qwen"
         }
         let menu = NSMenu()
         menu.addItem(
             NSMenuItem(
-                title: "Run on Focused Textbox (⌥A+I)",
+                title: "Claude on Focused Textbox (⌥A+I)",
                 action: #selector(triggerFromMenu),
+                keyEquivalent: ""
+            )
+        )
+        menu.addItem(
+            NSMenuItem(
+                title: "Local Qwen on Focused Textbox (⌥L+M)",
+                action: #selector(triggerLocalFromMenu),
                 keyEquivalent: ""
             )
         )
@@ -801,38 +1070,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func updateStatus(_ state: String) {
         switch state {
         case "thinking":
-            statusItem?.button?.title = "◍"
-            statusItem?.button?.toolTip = "optionai — thinking (⌥A+I to cancel)"
+            statusItem?.button?.title = activeBackend == .local ? "LM ◍" : "◍"
+            statusItem?.button?.toolTip =
+                "optionai — \(activeBackend?.label ?? "agent") working (either chord to cancel)"
         case "waiting":
             statusItem?.button?.title = "◌"
             statusItem?.button?.toolTip =
-                "optionai — grant Accessibility to enable Option+A+I "
+                "optionai — grant Accessibility to enable Option+A+I / Option+L+M "
                 + "(System Settings → Privacy & Security → Accessibility)"
         default:
             statusItem?.button?.title = "AI"
-            statusItem?.button?.toolTip = "optionai — Option+A+I"
+            statusItem?.button?.toolTip = "optionai — ⌥A+I: Claude · ⌥L+M: local Qwen"
         }
     }
 
     @objc private func triggerFromMenu() {
-        trigger()
+        trigger(backend: .claude)
+    }
+
+    @objc private func triggerLocalFromMenu() {
+        trigger(backend: .local)
     }
 
     @objc private func cancelFromMenu() {
         engine.cancel()
+        localEngine.cancel()
+        activeBackend = nil
         orb.hide()
         updateStatus("idle")
     }
 
     @objc private func quit() {
+        engine.cancel()
+        localEngine.cancel()
         NSApp.terminate(nil)
     }
 
-    // MARK: hotkey — Option+A+I chord (CGEvent tap)
+    // MARK: hotkeys — Option+A+I / Option+L+M chords (CGEvent tap)
 
     /// A two-letter chord is not expressible as a normal global hotkey, so a
-    /// session event tap tracks held keys. ⌥A ("å") and ⌥I (dead-key ˆ) are swallowed so
-    /// the chord never types accented characters into the focused app.
+    /// session event tap tracks held keys. Both chords' key events are
+    /// swallowed so the chord never types characters into the focused app.
     private func registerChordTap() -> Bool {
         let mask: CGEventMask =
             (1 << CGEventType.keyDown.rawValue)
@@ -868,22 +1146,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     ) -> Unmanaged<CGEvent>? {
         // The system disables taps that stall; re-enable and pass through.
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            chordHeld.removeAll()
+            swallowedKeys.removeAll()
+            chordTriggered = false
             if let tap = eventTap { CGEvent.tapEnable(tap: tap, enable: true) }
             return Unmanaged.passUnretained(event)
         }
 
-        let keyA: Int64 = 0   // kVK_ANSI_A
-        let keyI: Int64 = 34  // kVK_ANSI_I
         let keycode = event.getIntegerValueField(.keyboardEventKeycode)
         let optionDown = event.flags.contains(.maskAlternate)
-        let isChordKey = (keycode == keyA || keycode == keyI)
+        let isChordKey = chords.contains { $0.keys.contains(keycode) }
 
         switch type {
         case .flagsChanged:
-            if !optionDown { chordHeld.removeAll() }
+            if !optionDown {
+                chordHeld.removeAll()
+                chordTriggered = false
+            }
             return Unmanaged.passUnretained(event)
 
         case .keyDown:
+            // A swallowed key remains swallowed even if Option is released
+            // before its autorepeats or key-up event arrive.
+            if swallowedKeys.contains(keycode) { return nil }
             guard optionDown, isChordKey,
                 !event.flags.contains(.maskCommand),
                 !event.flags.contains(.maskControl)
@@ -895,18 +1180,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return nil
             }
 
+            swallowedKeys.insert(keycode)
+            guard !chordTriggered else { return nil }
             chordHeld.insert(keycode)
-            if chordHeld.contains(keyA), chordHeld.contains(keyI) {
-                chordHeld.removeAll()
-                DispatchQueue.main.async { self.trigger() }
+            if let chord = chords.first(where: { $0.keys.isSubset(of: chordHeld) }) {
+                chordTriggered = true
+                let backend = chord.backend
+                DispatchQueue.main.async { self.trigger(backend: backend) }
             }
-            return nil  // ⌥A / ⌥I never reach the app
+            return nil
 
         case .keyUp:
-            if isChordKey {
-                let wasHeld = chordHeld.contains(keycode)
-                chordHeld.remove(keycode)
-                if wasHeld, optionDown { return nil }
+            chordHeld.remove(keycode)
+            if swallowedKeys.remove(keycode) != nil {
+                // Holding Option is fine: release the letter keys, then
+                // press either chord again to cancel the active request.
+                if swallowedKeys.isEmpty { chordTriggered = false }
+                return nil
             }
             return Unmanaged.passUnretained(event)
 
@@ -919,8 +1209,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 // MARK: - main
 
-let app = NSApplication.shared
-let delegate = AppDelegate()
-app.delegate = delegate
-app.setActivationPolicy(.accessory)
-app.run()
+if CommandLine.arguments.contains("--local-smoke-test") {
+    // Diagnostic mode never touches Accessibility, the clipboard, or Claude.
+    // Piped stdin is treated as a selected passage; an interactive terminal
+    // uses a fixed public instruction. Only this explicit mode prints output.
+    let input: String
+    if isatty(STDIN_FILENO) != 0 {
+        input = "Reply with exactly: Local model ready."
+    } else {
+        let data = FileHandle.standardInput.readDataToEndOfFile()
+        input = String(data: data, encoding: .utf8) ?? ""
+    }
+    guard !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        fputs("optionai: provide UTF-8 text on stdin, or run from a terminal for the default test.\n", stderr)
+        exit(1)
+    }
+    let engine = LocalAgentEngine()
+    var finished = false
+    var status: Int32 = 1
+    engine.run(context: .selection(input)) { result in
+        switch result {
+        case .success(let text):
+            print(text)
+            status = 0
+        case .failure(let error):
+            fputs("optionai: local smoke test failed: \(error.localizedDescription)\n", stderr)
+        }
+        finished = true
+    }
+    while !finished { RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05)) }
+    exit(status)
+} else {
+    let app = NSApplication.shared
+    let delegate = AppDelegate()
+    app.delegate = delegate
+    app.setActivationPolicy(.accessory)
+    app.run()
+}

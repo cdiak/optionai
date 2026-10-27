@@ -101,8 +101,10 @@ echo "  log:     $HOME/Library/Logs/optionai.log"
 echo "  claude:  $CLAUDE_CLI"
 echo "  model:   ${OPTIONAI_MODEL:-(cli default)}"
 echo
-echo "Hotkey: Option+A+I  (hold Option, press A and I together)"
-echo "        Press again while running to cancel."
+echo "Hotkeys: Option+A+I  — Claude (hold Option, press A and I together)"
+echo "         Option+L+M  — local Qwen3.5 9B Q4_K_M through Ollama"
+echo "         Press either chord while running to cancel."
+echo "Local model setup: see LOCAL_MODEL.md (Ollama must be running)."
 echo
 echo "Context rule:"
 echo "  selection → the selection is the context"
@@ -112,7 +114,7 @@ echo
 echo "Permissions (first run):"
 echo "  System Settings → Privacy & Security → Accessibility → optionai"
 echo "  If missing from the list, run once: $DEST"
-echo "  Option+A+I activates automatically once granted (menu bar: ◌ → AI, no restart)"
+echo "  Both hotkeys activate automatically once granted (menu bar: ◌ → AI, no restart)"
 echo
 echo "Menu bar: \"AI\" idle · \"◍\" thinking (plus a floating orb near the caret)"
 echo "Uninstall: ./uninstall.sh"

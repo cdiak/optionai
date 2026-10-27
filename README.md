@@ -2,6 +2,10 @@
 
 **Option+A+I — an agent at your cursor, everywhere on your Mac.**
 
+**Option+L+M — the same interaction with a local model.** Uses Qwen3.5 9B Q4_K_M
+through [Ollama](https://ollama.com), with no cloud fallback. See
+[local model setup and usage](LOCAL_MODEL.md).
+
 Put your cursor in any text field. Hold **Option**, then press **A** and **I** together (two hands, on purpose). optionai reads the context of the textbox you are in. It sends that context to a coding agent ([Claude Code](https://claude.com/claude-code), `claude -p`). It pastes the agent's response at your cursor. A small orb floats near the pointer while the agent thinks.
 
 ```
@@ -18,7 +22,7 @@ Copy everything inside the block below and paste it into a coding agent (Claude 
 Set up optionai: a system-wide "agent at the cursor" hotkey (Option+A+I) on this Mac. Do every step yourself in the shell; do not tell me what to run. Stay on macOS only.
 
 Repo: https://github.com/cdiak/optionai
-Install dir: ~/Development/Projects/optionai (create parent dirs if needed)
+Source dir: ~/.local/src/optionai unless I name another folder (create parent dirs if needed). It only holds the source to build from; install.sh copies everything it runs into ~/.local.
 Binary: ~/.local/bin/optionai
 LaunchAgent label: com.cdiak.optionai
 
@@ -29,11 +33,12 @@ Steps:
    - Ensure the Claude Code CLI (claude) is available. If missing, install it with: curl -fsSL https://claude.ai/install.sh | bash
    - Check auth: if `claude -p "say ok"` fails with an auth error, tell me to run `claude` once and log in, then continue.
 2. Clone
-   - If ~/Development/Projects/optionai is already a git clone of this repo, git pull --ff-only origin main (or the default branch).
-   - If that path exists but is not this repo, move it to ~/Development/Projects/optionai.bak.<timestamp>.
-   - Otherwise: git clone https://github.com/cdiak/optionai.git ~/Development/Projects/optionai
+   - Call the source dir SRC.
+   - If SRC is already a git clone of this repo, git pull --ff-only origin main (or the default branch).
+   - If SRC exists but is not this repo, move it to SRC.bak.<timestamp>.
+   - Otherwise: git clone https://github.com/cdiak/optionai.git SRC
 3. Install
-   - cd ~/Development/Projects/optionai
+   - cd SRC
    - ./install.sh
 4. Verify process
    - Confirm ~/.local/bin/optionai exists and is executable.
